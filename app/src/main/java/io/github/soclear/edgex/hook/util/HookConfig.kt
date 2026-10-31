@@ -37,6 +37,10 @@ inline fun <reified T : HookConfig> Context.getHookConfig(
         file.writeText(string)
         return hookConfigFromDexKit
     }
-    // DexKit 解析 hook 配置失败
-    return null
+    // DexKit 解析 hook 配置失败（例如 Edge 更新后特征字符串变化）：
+    // 回退到旧版本缓存，让还能对上的方法/字段继续工作，而不是整个模块失效。
+    de.robv.android.xposed.XposedBridge.log(
+        "[EdgeX][HookConfig] 当前版本解析失败，回退到旧缓存（versionCode=${hookConfigFromFile?.versionCode}）"
+    )
+    return hookConfigFromFile
 }

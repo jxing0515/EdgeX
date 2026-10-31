@@ -43,6 +43,7 @@ import java.io.File
 import java.lang.ref.WeakReference
 import java.lang.reflect.Field
 import java.lang.reflect.Method
+import java.lang.reflect.Modifier
 import java.text.DecimalFormat
 import kotlin.math.log10
 import kotlin.math.pow
@@ -74,9 +75,102 @@ object Download {
         }
 
     /**
-     * 实时读取当前的设置文件。下载链路每次触发时都读一次，
-     * 这样在下载对话框里“记住选择”后立即生效，不需要重启 Edge。
+     * DownloadInfo 的字段名会被 R8 每次构建重命名；类型和声明顺序则稳定。
+     * 这里优先按类型/运行时值特征定位字段，名字只作为最后回退，
+     * 避免 Edge 更新后读到错位的字段。
      */
+    private const val DOWNLOAD_INFO_FIELDS_KEY = "EdgeXDownloadInfoFields"
+
+    private class DownloadInfoFields(
+        val url: Field?,
+        val referrer: Field?,
+        val guid: Field?,
+        val mimeType: Field?,
+        val fileName: Field?,
+        val cookie: Field?,
+        val userAgent: Field?,
+        val totalBytes: Field?,
+        val otrProfileId: Field?,
+    )
+
+    private fun resolveDownloadInfoFields(info: Any): DownloadInfoFields {
+        val cls = info.javaClass
+        val cached = try {
+            XposedHelpers.getAdditionalStaticField(cls, DOWNLOAD_INFO_FIELDS_KEY)
+        } catch (_: Throwable) {
+            null
+        }
+        if (cached is DownloadInfoFields) return cached
+
+        val fields = cls.allFields.filter {
+            !Modifier.isStatic(it.modifiers) && !Modifier.isTransient(it.modifiers)
+        }
+        fields.forEach {
+            try {
+                it.isAccessible = true
+            } catch (_: Throwable) {
+            }
+        }
+
+        fun valueOf(field: Field): Any? = try {
+            field.get(info)
+        } catch (_: Throwable) {
+            null
+        }
+
+        val gurlFields = fields.filter { it.type.name == "org.chromium.url.GURL" }
+        val stringFields = fields.filter { it.type == String::class.java }
+        val stringValues = stringFields.map { it to (valueOf(it) as? String) }
+        val longFields = fields.filter { it.type == Long::class.javaPrimitiveType }
+        val longValues = longFields.map { it to (valueOf(it) as? Long) }
+
+        val uuidRegex = Regex(
+            "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        )
+
+        // guid 是 UUID 字符串
+        val guid = stringValues.firstOrNull { (_, v) -> v != null && uuidRegex.matches(v) }?.first
+            ?: stringFields.getOrNull(6)
+        // mimeType 形如 application/zip
+        val mimeType = stringValues.firstOrNull { (_, v) ->
+            v != null && v.contains('/') && !v.contains("://")
+        }?.first ?: stringFields.getOrNull(1)
+        // userAgent 含 Mozilla/Android/Chrome
+        val userAgent = stringValues.firstOrNull { (_, v) ->
+            v != null && (v.contains("Mozilla") || v.contains("Android") || v.contains("Chrome/"))
+        }?.first ?: stringFields.getOrNull(0)
+        // cookie 形如 "a=b; c=d"
+        val cookie = stringValues.firstOrNull { (_, v) ->
+            v != null && v.contains('=') && v.contains(';')
+        }?.first ?: stringFields.getOrNull(2)
+        // fileName 带扩展名，且不是 mime/URL/UA
+        val fileName = stringValues.firstOrNull { (_, v) ->
+            v != null && v.contains('.') && !v.contains("://") && !v.contains('/')
+        }?.first ?: stringFields.getOrNull(3)
+        // totalBytes: long 里的字节数；时间戳字段通常是 13 位毫秒值
+        val totalBytes = longValues.firstOrNull { (_, v) ->
+            v != null && v >= 0 && v < 1_000_000_000_000L
+        }?.first ?: longFields.getOrNull(1)
+
+        val resolved = DownloadInfoFields(
+            url = gurlFields.getOrNull(0),
+            referrer = gurlFields.getOrNull(1),
+            guid = guid,
+            mimeType = mimeType,
+            fileName = fileName,
+            cookie = cookie,
+            userAgent = userAgent,
+            totalBytes = totalBytes,
+            otrProfileId = fields.firstOrNull { it.type.name.endsWith("OtrProfileId") },
+        )
+        try {
+            XposedHelpers.setAdditionalStaticField(cls, DOWNLOAD_INFO_FIELDS_KEY, resolved)
+        } catch (_: Throwable) {
+        }
+        return resolved
+    }
+
+
     private fun readPreference(context: Context): Preference? = try {
         val file = File(
             context.applicationInfo.dataDir,
@@ -148,7 +242,14 @@ object Download {
                     XposedHelpers.callStaticMethod(applicationStatusClass, "getLastTrackedFocusedActivity") as? Activity
                 } catch (_: Throwable) {
                     try {
-                        XposedHelpers.getStaticObjectField(applicationStatusClass, "d") as? Activity
+                        // 静态字段名会被 R8 重命名，按类型（Activity）定位
+                        applicationStatusClass.allFields.firstOrNull {
+                            Modifier.isStatic(it.modifiers) &&
+                                it.type.name == Activity::class.java.name
+                        }?.let { field ->
+                            field.isAccessible = true
+                            field.get(null) as? Activity
+                        }
                     } catch (_: Throwable) {
                         null
                     }
@@ -269,8 +370,19 @@ object Download {
                         override fun beforeHookedMethod(param: MethodHookParam) {
                             try {
                                 try {
-                                    XposedHelpers.setObjectField(param.thisObject, "c", param.args[0])
-                                    XposedHelpers.setObjectField(param.thisObject, "f", param.args[5])
+                                    // 字段名会被 R8 重命名，按类型定位 WindowAndroid / Profile
+                                    param.thisObject.javaClass.allFields.firstOrNull {
+                                        it.type.name == windowAndroidClass.name
+                                    }?.let { field ->
+                                        field.isAccessible = true
+                                        field.set(param.thisObject, param.args[0])
+                                    }
+                                    param.thisObject.javaClass.allFields.firstOrNull {
+                                        it.type.name == profileClass.name
+                                    }?.let { field ->
+                                        field.isAccessible = true
+                                        field.set(param.thisObject, param.args[5])
+                                    }
                                 } catch (_: Throwable) {}
                                 val suggestedPath = (param.args[4] as? String)?.takeIf { it.isNotEmpty() } ?: ""
                                 val method = completeDialogMethod
@@ -376,40 +488,63 @@ object Download {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     try {
                         val downloadInfo = param.args[0] ?: return
+                        // 字段名可能随 Edge 更新变化，按类型/值特征解析一次后缓存
+                        val infoFields = resolveDownloadInfoFields(downloadInfo)
 
-                        // GUID（DownloadInfo.l），用于去重与取消 Edge 原生下载
-                        val guid = XposedHelpers.getObjectField(downloadInfo, "l") as? String
-                            ?: return
+                        fun readString(field: Field?): String? = try {
+                            field?.get(downloadInfo) as? String
+                        } catch (_: Throwable) {
+                            null
+                        }
+
+                        // GUID 用于去重与取消 Edge 原生下载
+                        val guid = readString(infoFields.guid) ?: return
                         // onDownloadUpdated 会随进度多次回调，只在首次接管
                         if (!handledGuids.add(guid)) return
 
-                        val mimeType = XposedHelpers.getObjectField(downloadInfo, "c") as? String
+                        val mimeType = readString(infoFields.mimeType)
                         // 排除插件
                         if (mimeType == "application/x-chrome-extension") {
                             return
                         }
 
-                        // URL（DownloadInfo.a 是 GURL），取字符串（方法名混淆，反射解析）
-                        val url = gurlToString(XposedHelpers.getObjectField(downloadInfo, "a"))
+                        // URL 是 GURL，取字符串（方法名混淆，反射解析）
+                        val url = gurlToString(
+                            try {
+                                infoFields.url?.get(downloadInfo)
+                            } catch (_: Throwable) {
+                                null
+                            }
+                        )
                         if (url.isNullOrEmpty()) return
 
-                        // referrer（DownloadInfo.h 是 GURL）
-                        val referrer = gurlToString(XposedHelpers.getObjectField(downloadInfo, "h"))
+                        // referrer 是另一个 GURL
+                        val referrer = gurlToString(
+                            try {
+                                infoFields.referrer?.get(downloadInfo)
+                            } catch (_: Throwable) {
+                                null
+                            }
+                        )
                         // cookie / UA 在新版 Edge 原生下载路径已不再传到 Java 层，恒为 null
-                        val cookie = XposedHelpers.getObjectField(downloadInfo, "d") as? String
-                        val userAgent = XposedHelpers.getObjectField(downloadInfo, "b") as? String
-                        // 文件名：优先用 DownloadInfo.e，否则从 url 推断
-                        val fileName = (XposedHelpers.getObjectField(downloadInfo, "e") as? String)
+                        val cookie = readString(infoFields.cookie)
+                        val userAgent = readString(infoFields.userAgent)
+                        // 文件名：优先用 DownloadInfo 自带字段，否则从 url 推断
+                        val fileName = readString(infoFields.fileName)
                             ?.takeIf { it.isNotEmpty() }
                             ?: URLUtil.guessFileName(url, null, mimeType)
-                        // 真实文件大小（DownloadInfo.k），拿不到则为 0/-1
+                        // 真实文件大小，拿不到则为 0/-1
                         val totalBytes = try {
-                            XposedHelpers.getLongField(downloadInfo, "k")
+                            infoFields.totalBytes?.getLong(downloadInfo) ?: 0L
                         } catch (_: Throwable) {
                             0L
                         }
-                        // OtrProfileId（DownloadInfo.p），取消下载时需要
-                        val otrProfileId = XposedHelpers.getObjectField(downloadInfo, "p")
+                        // OtrProfileId，取消下载时需要
+                        val otrProfileId = try {
+                            infoFields.otrProfileId?.get(downloadInfo)
+                        } catch (_: Throwable) {
+                            null
+                        }
 
                         val activity = getTopActivity()
                         val isValidActivity =

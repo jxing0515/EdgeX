@@ -7,6 +7,7 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import io.github.soclear.edgex.data.Preference
 import io.github.soclear.edgex.hook.util.afterAttach
+import io.github.soclear.edgex.hook.util.allFields
 import kotlinx.serialization.json.Json
 import org.luckypray.dexkit.DexKitBridge
 import java.io.File
@@ -247,7 +248,19 @@ object Crx {
             classLoader
         )
         val profileReady = try {
-            profileManagerClass == null || XposedHelpers.getStaticBooleanField(profileManagerClass, "b")
+            profileManagerClass == null || run {
+                // 静态布尔字段名会被 R8 重命名，按类型定位
+                val readyField = profileManagerClass.allFields.firstOrNull {
+                    Modifier.isStatic(it.modifiers) &&
+                        it.type == Boolean::class.javaPrimitiveType
+                }
+                if (readyField == null) {
+                    true
+                } else {
+                    readyField.isAccessible = true
+                    readyField.getBoolean(null)
+                }
+            }
         } catch (_: Throwable) {
             true
         }
