@@ -52,27 +52,32 @@ import kotlin.math.roundToInt
 
 object Download {
 
-    // 只把“像下载器”的应用列进候选/允许记住，避免把音乐播放器等误记成默认下载器。
-    private val DOWNLOADER_PACKAGE_KEYWORDS =
-        listOf("download", "xunlei", "thunder", "idm", "adm", "aria", "m3u8")
+    // 仅用于排序：把明显的下载器排在列表前面。不作为过滤条件，
+    // 这样网盘、国际版等不在关键词里的下载器也能被选中。
+    private val DOWNLOADER_KEYWORDS =
+        listOf("download", "downloader", "xunlei", "thunder", "idm", "adm", "aria", "m3u8", "云盘", "下载")
 
-    internal fun isLikelyDownloader(packageName: String): Boolean {
-        val lower = packageName.lowercase()
-        return DOWNLOADER_PACKAGE_KEYWORDS.any { lower.contains(it) }
+    private fun looksLikeDownloader(packageName: String, label: String): Boolean {
+        val text = "$packageName $label".lowercase()
+        return DOWNLOADER_KEYWORDS.any { text.contains(it) }
     }
 
     /**
-     * 修正被误记成非下载器的默认下载器（例如媒体播放器），
-     * 让下载流程回退到弹窗让用户重新选择。
+     * 只作废“应用已卸载”的默认下载器；其它情况尊重用户的选择，
+     * 避免把不按关键词命名的下载器误判为无效。
      */
-    internal fun sanitize(preference: Preference): Preference =
-        if (preference.setDefaultDownloader &&
-            !isLikelyDownloader(preference.defaultDownloaderPackageName)
-        ) {
-            preference.copy(setDefaultDownloader = false)
-        } else {
-            preference
+    internal fun sanitize(context: Context, preference: Preference): Preference {
+        if (!preference.setDefaultDownloader) return preference
+        val pkg = preference.defaultDownloaderPackageName
+        if (pkg.isBlank()) return preference.copy(setDefaultDownloader = false)
+        val installed = try {
+            context.packageManager.getApplicationInfo(pkg, 0)
+            true
+        } catch (_: Throwable) {
+            false
         }
+        return if (installed) preference else preference.copy(setDefaultDownloader = false)
+    }
 
     /**
      * DownloadInfo 的字段名会被 R8 每次构建重命名；类型和声明顺序则稳定。
@@ -179,7 +184,7 @@ object Download {
         if (!file.exists()) {
             null
         } else {
-            sanitize(Json.decodeFromString<Preference>(file.readText()))
+            sanitize(context, Json.decodeFromString<Preference>(file.readText()))
         }
     } catch (_: Throwable) {
         null
@@ -768,7 +773,8 @@ object Download {
 
                 /**
                  * 查询能处理当前下载链接的应用，供对话框直接列出（包名 to 应用名）。
-                 * 用应用名而不是 Activity 名，并过滤浏览器自身与系统下载/文件管理器。
+                 * 用应用名而不是 Activity 名；只排除浏览器自身与系统下载/文件管理器，
+                 * 其余全部保留（下载器优先排序），避免只认某几个应用。
                  */
                 @Suppress("DEPRECATION")
                 private fun queryDownloaderCandidates(
@@ -796,7 +802,6 @@ object Download {
                             .mapNotNull { info ->
                                 val pkg = info.activityInfo?.packageName ?: return@mapNotNull null
                                 if (pkg in excluded) return@mapNotNull null
-                                if (!isLikelyDownloader(pkg)) return@mapNotNull null
                                 val label = try {
                                     pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0))
                                         .toString().trim()
@@ -806,6 +811,12 @@ object Download {
                                 if (label.isEmpty()) null else pkg to label
                             }
                             .distinctBy { it.first }
+                            // 下载器排前面，其余按名称排序；不丢任何应用
+                            .sortedWith(
+                                compareByDescending<Pair<String, String>> {
+                                    looksLikeDownloader(it.first, it.second)
+                                }.thenBy { it.second.lowercase() }
+                            )
                     } catch (_: Throwable) {
                         emptyList()
                     }

@@ -36,8 +36,7 @@ class Main : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
         val preference: Preference = try {
             val dataStoreFile = File(lpparam.appInfo.dataDir, "files/datastore/${Preference.FILE_NAME}")
-            // 自愈：被误记成非下载器（例如音乐播放器）的默认下载器直接作废，回退到弹窗选择
-            Download.sanitize(json.decodeFromString<Preference>(dataStoreFile.readText()))
+            json.decodeFromString<Preference>(dataStoreFile.readText())
         } catch (_: Exception) {
             null
         } ?: run {
