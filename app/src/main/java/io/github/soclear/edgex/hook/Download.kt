@@ -815,8 +815,17 @@ object Download {
                                 // 使用 queryIntentActivities 获取所有能处理该 Intent 的 Activity
                                 @SuppressLint("QueryPermissionsNeeded")
                                 val resolveInfos = pm.queryIntentActivities(testIntent, 0)
-                                // 从中筛选出真正属于目标包名（例如 IDM+）的 Activity
-                                val targetInfo = resolveInfos.find { it.activityInfo.packageName == targetPackageName }
+                                // 同一个应用可能有多个入口（例如 IDM+ 既有浏览器入口，也有纯下载 Activity）。
+                                // 优先选名字像“下载”的入口，并避开浏览器/启动器入口，避免跳进下载器自带的浏览器。
+                                val candidates = resolveInfos.filter {
+                                    it.activityInfo.packageName == targetPackageName
+                                }
+                                val targetInfo = candidates.firstOrNull {
+                                    it.activityInfo.name.contains("download", true)
+                                } ?: candidates.firstOrNull {
+                                    !it.activityInfo.name.contains("browser", true) &&
+                                        !it.activityInfo.name.contains("launcher", true)
+                                } ?: candidates.firstOrNull()
 
                                 if (targetInfo != null) {
                                     // 找到了目标应用内的真实 Activity，强制转为显式 Intent
