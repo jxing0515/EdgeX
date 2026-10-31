@@ -29,7 +29,13 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import io.github.soclear.edgex.R
 import io.github.soclear.edgex.data.DownloaderType
+import io.github.soclear.edgex.data.Preference
 import io.github.soclear.edgex.hook.util.afterAttach
+import io.github.soclear.edgex.ui.dataStore
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
 import io.github.soclear.edgex.hook.util.allFields
 import io.github.soclear.edgex.hook.util.getHookConfig
 import org.luckypray.dexkit.wrap.DexMethod
@@ -44,6 +50,70 @@ import kotlin.math.roundToInt
 
 
 object Download {
+
+    // 只把“像下载器”的应用列进候选/允许记住，避免把音乐播放器等误记成默认下载器。
+    private val DOWNLOADER_PACKAGE_KEYWORDS =
+        listOf("download", "xunlei", "thunder", "idm", "adm", "aria", "m3u8")
+
+    internal fun isLikelyDownloader(packageName: String): Boolean {
+        val lower = packageName.lowercase()
+        return DOWNLOADER_PACKAGE_KEYWORDS.any { lower.contains(it) }
+    }
+
+    /**
+     * 修正被误记成非下载器的默认下载器（例如媒体播放器），
+     * 让下载流程回退到弹窗让用户重新选择。
+     */
+    internal fun sanitize(preference: Preference): Preference =
+        if (preference.setDefaultDownloader &&
+            !isLikelyDownloader(preference.defaultDownloaderPackageName)
+        ) {
+            preference.copy(setDefaultDownloader = false)
+        } else {
+            preference
+        }
+
+    /**
+     * 实时读取当前的设置文件。下载链路每次触发时都读一次，
+     * 这样在下载对话框里“记住选择”后立即生效，不需要重启 Edge。
+     */
+    private fun readPreference(context: Context): Preference? = try {
+        val file = File(
+            context.applicationInfo.dataDir,
+            "files/datastore/${Preference.FILE_NAME}"
+        )
+        if (!file.exists()) {
+            null
+        } else {
+            sanitize(Json.decodeFromString<Preference>(file.readText()))
+        }
+    } catch (_: Throwable) {
+        null
+    }
+
+    /**
+     * 记住用户这次选择的第三方下载器：写入默认下载器设置，
+     * 下次点下载会直接交给它，不再弹 EdgeX 的对话框。
+     */
+    private fun rememberDownloader(activity: Activity, packageName: String) {
+        try {
+            val app = activity.applicationContext
+            CoroutineScope(Dispatchers.IO).launch {
+                try {
+                    app.dataStore.updateData { current ->
+                        current.copy(
+                            setDefaultDownloader = true,
+                            defaultDownloaderType = DownloaderType.THIRD_PARTY_APP,
+                            defaultDownloaderPackageName = packageName
+                        )
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+            Toast.makeText(activity, "已记住此下载器，下次下载直接使用", Toast.LENGTH_SHORT).show()
+        } catch (_: Throwable) {
+        }
+    }
 
     fun externalDownload(
         blockOriginalDownloadDialog: Boolean,
@@ -348,10 +418,21 @@ object Download {
                             (if (isValidActivity) activity else AndroidAppHelper.currentApplication())
                                 ?: return
 
+                        // 每次下载时实时读取设置，保证在下载对话框里“记住选择”后立即生效，
+                        // 不需要重启 Edge 才走默认下载器。
+                        val livePreference = readPreference(context)
+                        val useDefaultDownloader =
+                            livePreference?.setDefaultDownloader ?: setDefaultDownloader
+                        val liveDownloaderType =
+                            livePreference?.defaultDownloaderType ?: defaultDownloaderType
+                        val liveDownloaderPackageName =
+                            livePreference?.defaultDownloaderPackageName
+                                ?: defaultDownloaderPackageName
+
                         // 只有在我们确实要接管时才取消 Edge 的原生下载，否则放行，避免下载丢失
-                        if (setDefaultDownloader) {
+                        if (useDefaultDownloader) {
                             cancelEdgeDownload(guid, otrProfileId)
-                            if (defaultDownloaderType == DownloaderType.SYSTEM_DOWNLOADER) {
+                            if (liveDownloaderType == DownloaderType.SYSTEM_DOWNLOADER) {
                                 systemDownload(
                                     url,
                                     cookie,
@@ -369,7 +450,7 @@ object Download {
                                     userAgent,
                                     referrer,
                                     context,
-                                    defaultDownloaderPackageName
+                                    liveDownloaderPackageName
                                 )
                             }
                         } else if (isValidActivity) {
@@ -472,32 +553,60 @@ object Download {
                         try {
                             // 模块资源注入在 Activity.attach 完成后；afterAttach 的 split Context
                             // 不保证包含模块资源，按钮文字必须从当前 Activity 读取。
+                            //
+                            // 一次点选：直接列出系统下载器 + 已安装的第三方下载器 + 其他应用兜底，
+                            // 不再让用户先选“第三方应用”再过一层系统选择器。
+                            val candidates = queryDownloaderCandidates(activity, url, mimeType)
+                            val labels = ArrayList<String>(candidates.size + 2)
+                            labels.add(activity.getString(R.string.download_system))
+                            candidates.mapTo(labels) { it.second }
+                            labels.add(activity.getString(R.string.download_third_party))
+
                             AlertDialog.Builder(activity)
                                 .setTitle(fileName)
                                 .setView(createUrlContainer(activity, totalBytes, url))
-                                .setPositiveButton(activity.getString(R.string.download_system)) { _, _ ->
-                                    systemDownload(
-                                        url,
-                                        cookie,
-                                        userAgent,
-                                        referrer,
-                                        mimeType,
-                                        fileName,
-                                        activity
-                                    )
+                                .setItems(labels.toTypedArray()) { _, which ->
+                                    try {
+                                        when (which) {
+                                            0 -> systemDownload(
+                                                url,
+                                                cookie,
+                                                userAgent,
+                                                referrer,
+                                                mimeType,
+                                                fileName,
+                                                activity
+                                            )
+
+                                            labels.lastIndex -> thirdPartyDownload(
+                                                url,
+                                                mimeType,
+                                                cookie,
+                                                userAgent,
+                                                referrer,
+                                                activity,
+                                                null
+                                            )
+
+                                            else -> {
+                                                val candidate = candidates[which - 1]
+                                                rememberDownloader(activity, candidate.first)
+                                                thirdPartyDownload(
+                                                    url,
+                                                    mimeType,
+                                                    cookie,
+                                                    userAgent,
+                                                    referrer,
+                                                    activity,
+                                                    candidate.first
+                                                )
+                                            }
+                                        }
+                                    } catch (t: Throwable) {
+                                        XposedBridge.log(t)
+                                    }
                                 }
-                                .setNegativeButton(activity.getString(R.string.download_third_party)) { _, _ ->
-                                    thirdPartyDownload(
-                                        url,
-                                        mimeType,
-                                        cookie,
-                                        userAgent,
-                                        referrer,
-                                        activity,
-                                        null
-                                    )
-                                }
-                                .setNeutralButton(activity.getString(R.string.download_copy_link)) { _, _ ->
+                                .setNegativeButton(activity.getString(R.string.download_copy_link)) { _, _ ->
                                     copyLink(activity, url)
                                 }
                                 .setOnDismissListener {
@@ -511,6 +620,51 @@ object Download {
                             onFailure()
                             XposedBridge.log(t)
                         }
+                    }
+                }
+
+                /**
+                 * 查询能处理当前下载链接的应用，供对话框直接列出（包名 to 应用名）。
+                 * 用应用名而不是 Activity 名，并过滤浏览器自身与系统下载/文件管理器。
+                 */
+                @Suppress("DEPRECATION")
+                private fun queryDownloaderCandidates(
+                    activity: Activity,
+                    url: String,
+                    mimeType: String?
+                ): List<Pair<String, String>> {
+                    return try {
+                        val uri = url.toUri()
+                        val intent = Intent(Intent.ACTION_VIEW).apply {
+                            if (!mimeType.isNullOrBlank()) {
+                                setDataAndType(uri, mimeType)
+                            } else {
+                                data = uri
+                            }
+                        }
+                        val pm = activity.packageManager
+                        val excluded = setOf(
+                            activity.packageName,
+                            "com.android.providers.downloads",
+                            "com.android.providers.downloads.ui",
+                            "com.android.documentsui",
+                        )
+                        pm.queryIntentActivities(intent, 0)
+                            .mapNotNull { info ->
+                                val pkg = info.activityInfo?.packageName ?: return@mapNotNull null
+                                if (pkg in excluded) return@mapNotNull null
+                                if (!isLikelyDownloader(pkg)) return@mapNotNull null
+                                val label = try {
+                                    pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0))
+                                        .toString().trim()
+                                } catch (_: Throwable) {
+                                    info.loadLabel(pm)?.toString()?.trim().orEmpty()
+                                }
+                                if (label.isEmpty()) null else pkg to label
+                            }
+                            .distinctBy { it.first }
+                    } catch (_: Throwable) {
+                        emptyList()
                     }
                 }
 

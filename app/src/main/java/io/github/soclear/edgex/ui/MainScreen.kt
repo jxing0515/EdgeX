@@ -234,7 +234,12 @@ fun MainScreen(viewModel: MainViewModel, modifier: Modifier = Modifier) {
                 checked = preference.externalDownload,
                 onCheckedChange = {
                     viewModel.updateData { currentPreference ->
-                        currentPreference.copy(externalDownload = it)
+                        // 开启外部下载时自动隐藏 Edge 原生下载界面，否则会先弹一次原生确认框。
+                        currentPreference.copy(
+                            externalDownload = it,
+                            blockOriginalDownloadDialog =
+                                if (it) true else currentPreference.blockOriginalDownloadDialog
+                        )
                     }
                 }
             )
