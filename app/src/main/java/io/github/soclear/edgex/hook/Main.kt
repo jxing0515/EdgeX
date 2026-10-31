@@ -45,49 +45,79 @@ class Main : IXposedHookLoadPackage, IXposedHookZygoteInit {
             return
         }
 
-        if (preference.hideStatusBar) {
-            Ui.hideStatusBar()
-        }
-        Ui.removePadding(preference.removeTopPadding, preference.removeBottomPadding)
-        if (preference.longClickOverflowButtonToTop) {
-            LongClick.setupScrollToTopOnLongClickOverflowButton()
-        }
-        if (preference.longClickNewTabButtonToLoadInplace) {
-            LongClick.setupLoadUrlOnLongClickNewTabButton(
-                if (preference.setNewTabPageUrl) preference.newTabPageUrl else "edge://newtab/"
-            )
-        }
-        if (preference.setNewTabPageUrl) {
-            Ui.setNewTabPageUrl(preference.newTabPageUrl)
-        }
-        if (preference.externalDownload) {
-            Download.externalDownload(
-                preference.blockOriginalDownloadDialog,
-                preference.setDefaultDownloader,
-                preference.defaultDownloaderType,
-                preference.defaultDownloaderPackageName
-            )
+        // 每个功能独立安装：某个 hook 因 Edge 改版失效时，不影响其它功能
+        fun install(name: String, block: () -> Unit) {
+            try {
+                block()
+            } catch (t: Throwable) {
+                XposedBridge.log("[EdgeX][Main] 「$name」安装失败（不影响其它功能）")
+                XposedBridge.log(t)
+            }
         }
 
-        if (preference.syncTabletToolbar) {
-            TabletToolbar.syncTabletToolbarWithDesktop()
+        install("隐藏状态栏") {
+            if (preference.hideStatusBar) {
+                Ui.hideStatusBar()
+            }
         }
-        if (preference.adjustUiSize) {
-            TabletToolbar.scaleBookmarkBarHeight(preference.bookmarkBarHeightPercent)
+        install("移除 padding") {
+            Ui.removePadding(preference.removeTopPadding, preference.removeBottomPadding)
         }
-
-        if (preference.longClickNewTabButtonToLoadInplace && preference.replaceNewTabPageWithHome) {
-            HomeButton.replaceNewTabPageWithHome()
+        install("长按更多回顶部") {
+            if (preference.longClickOverflowButtonToTop) {
+                LongClick.setupScrollToTopOnLongClickOverflowButton()
+            }
         }
-        if (preference.clearBrowsingDataOnExit) {
-            BrowsingData.clearBrowsingDataOnExit(
-                preference.clearBrowsingDataOnExitDataTypes.toIntArray(),
-                preference.clearBrowsingDataOnExitShouldClearTabs,
-                preference.clearBrowsingDataOnExitTimePeriod
-            )
+        install("长按新标签页原地加载") {
+            if (preference.longClickNewTabButtonToLoadInplace) {
+                LongClick.setupLoadUrlOnLongClickNewTabButton(
+                    if (preference.setNewTabPageUrl) preference.newTabPageUrl else "edge://newtab/"
+                )
+            }
         }
-        if (preference.redirectCustomTab) {
-            CustomTab.redirectCustomTab(lpparam)
+        install("设置新标签页 URL") {
+            if (preference.setNewTabPageUrl) {
+                Ui.setNewTabPageUrl(preference.newTabPageUrl)
+            }
+        }
+        install("外部下载") {
+            if (preference.externalDownload) {
+                Download.externalDownload(
+                    preference.blockOriginalDownloadDialog,
+                    preference.setDefaultDownloader,
+                    preference.defaultDownloaderType,
+                    preference.defaultDownloaderPackageName
+                )
+            }
+        }
+        install("平板工具栏同步") {
+            if (preference.syncTabletToolbar) {
+                TabletToolbar.syncTabletToolbarWithDesktop()
+            }
+        }
+        install("收藏夹栏高度") {
+            if (preference.adjustUiSize) {
+                TabletToolbar.scaleBookmarkBarHeight(preference.bookmarkBarHeightPercent)
+            }
+        }
+        install("主页按钮替换") {
+            if (preference.longClickNewTabButtonToLoadInplace && preference.replaceNewTabPageWithHome) {
+                HomeButton.replaceNewTabPageWithHome()
+            }
+        }
+        install("退出清除浏览数据") {
+            if (preference.clearBrowsingDataOnExit) {
+                BrowsingData.clearBrowsingDataOnExit(
+                    preference.clearBrowsingDataOnExitDataTypes.toIntArray(),
+                    preference.clearBrowsingDataOnExitShouldClearTabs,
+                    preference.clearBrowsingDataOnExitTimePeriod
+                )
+            }
+        }
+        install("强制外部浏览器") {
+            if (preference.redirectCustomTab) {
+                CustomTab.redirectCustomTab(lpparam)
+            }
         }
     }
 }

@@ -149,16 +149,14 @@ object Crx {
         }
     }
 
-    // 按调用关系定位混淆方法，避免依赖方法名和声明顺序。
+    // 按调用关系定位混淆方法，避免依赖方法名和声明顺序；
+    // 同时不再强制要求 native bridge 类叫 "J.N"（类名也可能随版本变化）。
     private fun findCrxInstallMethod(classLoader: ClassLoader): Method? {
         val nativeBridgeClass = XposedHelpers.findClassIfExists("J.N", classLoader)
-            ?: run {
-                logCrx("Native class J.N not found")
-                return null
-            }
+        val cacheHost: Any = nativeBridgeClass ?: Crx::class.java
 
         (XposedHelpers.getAdditionalStaticField(
-            nativeBridgeClass,
+            cacheHost,
             CRX_INSTALL_METHOD_FIELD
         ) as? Method)?.let {
             return it
@@ -182,7 +180,6 @@ object Crx {
                     .flatMap { entryMethod ->
                         entryMethod.invokes.findMethod {
                             matcher {
-                                declaredClass = "J.N"
                                 modifiers = Modifier.STATIC
                                 returnType = "void"
                                 paramTypes("int", "java.lang.Object")
@@ -195,7 +192,7 @@ object Crx {
         } catch (t: Throwable) {
             logCrx("Failed to resolve CRX install method", t)
             null
-        } ?: nativeBridgeClass.declaredMethods.singleOrNull {
+        } ?: nativeBridgeClass?.declaredMethods?.singleOrNull {
             Modifier.isStatic(it.modifiers) &&
                 it.returnType == Void.TYPE &&
                 it.parameterTypes.size == 2 &&
@@ -206,7 +203,7 @@ object Crx {
         return installMethod?.also {
             it.isAccessible = true
             XposedHelpers.setAdditionalStaticField(
-                nativeBridgeClass,
+                cacheHost,
                 CRX_INSTALL_METHOD_FIELD,
                 it
             )

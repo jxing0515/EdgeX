@@ -103,6 +103,13 @@ object SettingsButton {
                         }
                     }
                 })
+                // 弹窗关闭时释放 ViewModel，避免每次打开设置都累积泄漏
+                dialog.setOnDismissListener {
+                    try {
+                        viewModel.close()
+                    } catch (_: Throwable) {
+                    }
+                }
                 dialog.show()
             } catch (e: Exception) {
                 XposedBridge.log("[EdgeX][SettingsButton] 展示设置弹窗失败: ${e.message}")

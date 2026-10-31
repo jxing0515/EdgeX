@@ -8,6 +8,7 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import io.github.soclear.edgex.hook.util.getChromeClassLoader
+import java.lang.reflect.Modifier
 
 
 object BrowsingData {
@@ -66,13 +67,37 @@ object BrowsingData {
                     // 关键1：安全地获取当前 App 的真正的 ClassLoader，防止外部闭包传参带来的类加载器不匹配
                     val appClassLoader = service.getChromeClassLoader()
                     val profileManagerClass = XposedHelpers.findClassIfExists("org.chromium.chrome.browser.profiles.ProfileManager", appClassLoader) ?: return
-                    val profile = XposedHelpers.callStaticMethod(profileManagerClass, "b") ?: return
+                    // 混淆方法名每个版本都可能变，按“静态 + 返回 Profile”定位
+                    val profile = profileManagerClass.declaredMethods.firstOrNull {
+                        Modifier.isStatic(it.modifiers) && it.parameterTypes.isEmpty() &&
+                            it.returnType.name == "org.chromium.chrome.browser.profiles.Profile"
+                    }?.let { method ->
+                        method.isAccessible = true
+                        method.invoke(null)
+                    } ?: return
+
                     val bridgeClass = XposedHelpers.findClass("org.chromium.chrome.browser.browsing_data.BrowsingDataBridge", appClassLoader)
-                    val bridge = XposedHelpers.callStaticMethod(bridgeClass, "b", profile) ?: return
+                    // 单例获取方法：静态 + 一个 Profile 参数 + 返回 BrowsingDataBridge
+                    val bridge = bridgeClass.declaredMethods.firstOrNull {
+                        Modifier.isStatic(it.modifiers) && it.parameterTypes.size == 1 &&
+                            it.parameterTypes[0].name == "org.chromium.chrome.browser.profiles.Profile" &&
+                            it.returnType == bridgeClass
+                    }?.let { method ->
+                        method.isAccessible = true
+                        method.invoke(null, profile)
+                    } ?: return
+
                     val listenerClass = XposedHelpers.findClass($$"org.chromium.chrome.browser.browsing_data.BrowsingDataBridge$OnClearBrowsingDataListener", appClassLoader)
 
-                    // 核心清除方法
-                    XposedHelpers.callMethod(bridge, "a", arrayOf(listenerClass, IntArray::class.javaPrimitiveType, Int::class.javaPrimitiveType), null, dataTypes, timePeriod)
+                    // 核心清除方法：按参数签名 (listener, int[], int) 定位，不依赖混淆方法名
+                    val clearMethod = bridgeClass.declaredMethods.firstOrNull {
+                        !Modifier.isStatic(it.modifiers) && it.parameterTypes.size == 3 &&
+                            it.parameterTypes[0] == listenerClass &&
+                            it.parameterTypes[1] == IntArray::class.javaPrimitiveType &&
+                            it.parameterTypes[2] == Int::class.javaPrimitiveType
+                    } ?: return
+                    clearMethod.isAccessible = true
+                    clearMethod.invoke(bridge, null, dataTypes, timePeriod)
 
                     if (shouldClearTabs) {
                         // ========= 物理抹除全部标签页记忆 =========

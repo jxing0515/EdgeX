@@ -480,11 +480,7 @@ object Download {
             classLoader
         ) ?: return@afterAttach
 
-        XposedHelpers.findAndHookMethod(
-            downloadController,
-            "onDownloadUpdated",
-            "org.chromium.chrome.browser.download.DownloadInfo",
-            object : XC_MethodHook() {
+        val onDownloadUpdatedHook = object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     try {
                         val downloadInfo = param.args[0] ?: return
@@ -499,6 +495,10 @@ object Download {
 
                         // GUID 用于去重与取消 Edge 原生下载
                         val guid = readString(infoFields.guid) ?: return
+                        // 防止长期使用后无界增长
+                        if (handledGuids.size > 512) {
+                            handledGuids.clear()
+                        }
                         // onDownloadUpdated 会随进度多次回调，只在首次接管
                         if (!handledGuids.add(guid)) return
 
@@ -619,12 +619,20 @@ object Download {
                     guid: String,
                     otrProfileId: Any?
                 ) {
+                    // 单例 getInstance 的方法名也会被混淆，按“静态 + 返回自身类型”定位
                     val dms = try {
-                        XposedHelpers.callStaticMethod(downloadManagerService, "a")
+                        downloadManagerService.declaredMethods.firstOrNull {
+                            Modifier.isStatic(it.modifiers) &&
+                                it.parameterTypes.isEmpty() &&
+                                it.returnType == downloadManagerService
+                        }?.let { method ->
+                            method.isAccessible = true
+                            method.invoke(null)
+                        }
                     } catch (t: Throwable) {
                         XposedBridge.log(t)
-                        return
-                    }
+                        null
+                    } ?: return
                     try {
                         XposedHelpers.callMethod(dms, "removeDownload", guid, otrProfileId, false)
                     } catch (t: Throwable) {
@@ -1096,6 +1104,33 @@ object Download {
                     }
                 }
             }
-        )
+
+        val hooked = try {
+            XposedHelpers.findAndHookMethod(
+                downloadController,
+                "onDownloadUpdated",
+                "org.chromium.chrome.browser.download.DownloadInfo",
+                onDownloadUpdatedHook
+            )
+            true
+        } catch (_: Throwable) {
+            false
+        }
+        if (!hooked) {
+            // 方法名随版本变化时，按参数签名扫描（DownloadInfo 参数）
+            XposedBridge.log("[EdgeX][Download] onDownloadUpdated 名字匹配失败，按参数签名扫描")
+            downloadController.declaredMethods
+                .filter {
+                    it.parameterTypes.size == 1 &&
+                        it.parameterTypes[0].name.endsWith("DownloadInfo")
+                }
+                .forEach { method ->
+                    try {
+                        XposedBridge.hookMethod(method, onDownloadUpdatedHook)
+                    } catch (t: Throwable) {
+                        XposedBridge.log(t)
+                    }
+                }
+        }
     }
 }

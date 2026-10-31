@@ -7,6 +7,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import io.github.soclear.edgex.data.Preference
 import io.github.soclear.edgex.ui.dataStore
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -24,6 +25,11 @@ class MainViewModel(application: Application) : ViewModel() {
                 nextPreference(it)
             }
         }
+    }
+
+    /** 设置弹窗关闭时调用，取消 Eagerly 启动的收集协程，避免每次打开都泄漏。 */
+    fun close() {
+        viewModelScope.cancel()
     }
 }
 
